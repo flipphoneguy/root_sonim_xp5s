@@ -11,7 +11,7 @@ This project provides root access for the Sonim XP5800 (XP5s) using CVE-2019-221
 ## Installation
 Open Termux and run the following commands:
 ```bash
-git clone [https://github.com/flipphoneguy/root_sonim_xp5s](https://github.com/flipphoneguy/root_sonim_xp5s)
+git clone https://github.com/flipphoneguy/root_sonim_xp5s
 cd root_sonim_xp5s
 ./setup.sh
 ```
@@ -58,4 +58,4 @@ If you're interested in helping with development or would like to reach out abou
 
 ---
 
-*If you enjoyed this, please drop a star.*
+**If you enjoyed this, please drop a star.**
