@@ -23,6 +23,7 @@ This project installs a binary at `/sbin/su`, allowing other apps to request roo
 | Command | Description |
 | :--- | :--- |
 | `sud` | Spawn a root shell. |
+| `sud -s "shell"` | Use specified shell instead of system default. |
 | `sud -c "cmd"` | Run a command as root and exit. |
 | `sud "cmd"` | Same result as `sud -c cmd` |
 | `sud -v` | Verbose output (debug mode). |
@@ -30,8 +31,24 @@ This project installs a binary at `/sbin/su`, allowing other apps to request roo
 **Note:** The command was named sud so it doesn't conflict with other termux root packages. you can manually rename it to 'su' if you wish to.
 
 ## Managing Access
+The su binary is equipped with security checks which you control:
 To deny a specific app root access, add its package name to the denied list:
-`~/.termux/root_files/su98-denied.txt`
+`/sdcard/root/blacklist.txt` (sdcard means internal storage.)
+If you choose this method, any app can get root unless it's in the blacklist.
+Alternatively you can create a whitelist.txt in the same location.
+If the whitelist.txt is present, every app will be revoked from accessing root unless it's package name is in the whitelist. (Exception being adb and termux which can always use root)
+To temporarilly remove the su binary run: 
+```bash
+~/.termux/root_files/uninstall.sh
+```
+To enable it again, run 
+```bash
+~.termux/root_files/install.sh
+```
+If you want to permanently remove it, run the above uninstall command and then run this to ensure it doesn't auto start again next time you restart your device:
+```bash
+rm ~/.termux/boot/install.sh
+```
 
 ---
 
@@ -52,9 +69,9 @@ Since the bootloader is locked and `/system` is read-only (protected by dm-verit
 **Notes for devs:** 
 * If you're interested, this can be expanded to work on the xp3800 too. you'd have to modify su98.c to work with 32bit.
 * I don't think modules or persistent switches to other protected directories like /system are possible. I tried but apparently it causes Sonim to go into panic mode where no app will open and at some point systemui stops... but if you're interested I can send you the code for that.
-* This can be compiled into a standalone app too. I once downloaded source code from some github repo which no-longer exists which didn't work (a small fixable issue) and was missing features but can be used as a base
+* This can be compiled into a standalone app too. I once downloaded source code from some github repo which no-longer exists which didn't work (a few small fixable issue) and was missing features but can be used as a base
 
-If you're interested in helping with development or would like to reach out about anything just send me an email at frumware1@gmail.com or join forums.jtechforums.org where I'm an active member and this is being disbussed
+If you're interested in helping with development or would like to reach out about anything just send me an email at frumware1@gmail.com or join forums.jtechforums.org where I'm an active member and this is being discussed
 
 ---
 

