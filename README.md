@@ -17,6 +17,10 @@ cd root_sonim_xp5s
 ```
 The setup script will compile and organize the necessary binaries, create a root helper script `sud` in your path, and attempt to gain root access immediately.
 
+## Update:
+Check out my other repo I made with a released 1 time install app for persistent root! Includes minimal simple UI for blocking apps from using root or temporarily disabling it.
+https://github.com/flipphoneguy/sonim-xp5s_root_app
+
 ## Usage
 This project installs a binary at `/sbin/su`, allowing other apps to request root access. It also provides a wrapper script `sud` for use inside Termux.
 
